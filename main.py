@@ -1,19 +1,18 @@
 import sys
 import os
-import time
 import re
 import yt_dlp
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, 
     QLineEdit, QListWidget, QProgressBar, QListWidgetItem, 
-    QMessageBox, QFileDialog
+    QMessageBox, QFileDialog, QLabel
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
 class DownloadWorker(QThread):
     """Thread for downloading YouTube videos with yt_dlp."""
-    progress = pyqtSignal(int, int)  
-    finished = pyqtSignal(int) 
+    progress = pyqtSignal(int, int, str, str)  # (video_index, progress, speed, downloaded)
+    finished = pyqtSignal(int)  
     error = pyqtSignal(str)  
 
     def __init__(self, url, video_index, save_path):
@@ -24,43 +23,35 @@ class DownloadWorker(QThread):
 
     def run(self):
         ydl_opts = {
-            'outtmpl': os.path.join(self.save_path, '%(title)s-%(id)s.%(ext)s'),  # Save to the chosen path
-            'noplaylist': True,  # Disable playlist download
-            'format': 'bestvideo+bestaudio/best',  # Ensure best video/audio is selected
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',  # Convert video to desired format
-                'preferedformat': 'mp4',  # Specify mp4 format
-            }],
-            'progress_hooks': [self.hook],
+            'outtmpl': os.path.join(self.save_path, '%(title)s.%(ext)s'),
+            'noplaylist': True,  
+            'format': 'bestvideo+bestaudio/best',  
+            'progress_hooks': [self.hook],  
+            'quiet': False,  
+            'noprogress': False,  
+            'nocolor': True,  
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(self.url, download=True)
-
-            time.sleep(1)  
-            temp_file = os.path.join(self.save_path, f"{info_dict['title']}-{info_dict['id']}.mp4.part")
-            final_file = os.path.join(self.save_path, f"{info_dict['title']}-{info_dict['id']}.mp4")
-
-            try:
-                if os.path.exists(temp_file):
-                    os.rename(temp_file, final_file)
-            except PermissionError:
-                self.error.emit("File is in use by another process. Retry later.")
-
+                ydl.download([self.url])  
         except Exception as e:
             self.error.emit(str(e))
 
     def hook(self, d):
+        """Hook function to update progress manually using downloaded bytes."""
         if d['status'] == 'downloading':
-            raw_percent = d.get('_percent_str', '0%')
+            total_bytes = d.get('total_bytes', 1)  
+            downloaded_bytes = d.get('downloaded_bytes', 0)  
+            progress = int((downloaded_bytes / total_bytes) * 100) if total_bytes > 0 else 0  
 
-            percent_cleaned = re.sub(r'\x1b\[[0-9;]*m', '', raw_percent).strip('%')
+            speed = d.get('_speed_str', '0 KiB/s')
+            downloaded_mb = downloaded_bytes / 1_048_576  
 
-            try:
-                self.progress.emit(self.video_index, int(float(percent_cleaned)))
-            except ValueError:
-                print(f"Skipping invalid percentage format: {raw_percent}")  
+            print(f"[DEBUG] Progress: {progress}% | Speed: {speed} | Downloaded: {downloaded_mb:.2f} MB")
+
+            self.progress.emit(self.video_index, progress, speed, f"{downloaded_mb:.2f} MB")
+
         elif d['status'] == 'finished':
             self.finished.emit(self.video_index)
 
@@ -69,8 +60,8 @@ class YouTubeDownloader(QWidget):
     def __init__(self):
         super().__init__()
         self.initUI()
-        self.threads = []  
-        self.save_path = ''  # Initialize save path
+        self.threads = []
+        self.save_path = ''
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -92,41 +83,73 @@ class YouTubeDownloader(QWidget):
 
         self.setLayout(layout)
         self.setWindowTitle("YouTube Video Downloader")
-        self.resize(500, 400)
+        self.resize(600, 500)
 
     def select_save_path(self):
         """Allow the user to select a folder where videos will be saved."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
-            self.save_path = folder  # Store the selected folder path
+            self.save_path = folder  
 
     def start_download(self):
         url = self.url_input.text().strip()
         if not url or not self.save_path:
+            QMessageBox.warning(self, "Warning", "Please enter a valid URL and select a save path!")
             return
         
         item = QListWidgetItem(self.list_widget)
+        widget = QWidget()
+        layout = QVBoxLayout()
+
+        title_label = QLabel("Downloading...")  
+        speed_label = QLabel("Speed: 0 KiB/s")  
+        downloaded_label = QLabel("Downloaded: 0 MB")  
         progress_bar = QProgressBar(self)
         progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)  
+
+        layout.addWidget(title_label)
+        layout.addWidget(progress_bar)
+        layout.addWidget(speed_label)
+        layout.addWidget(downloaded_label)
+
+        widget.setLayout(layout)
+        item.setSizeHint(widget.sizeHint())
         self.list_widget.addItem(item)
-        self.list_widget.setItemWidget(item, progress_bar)
+        self.list_widget.setItemWidget(item, widget)
 
         thread = DownloadWorker(url, self.list_widget.count() - 1, self.save_path)
         thread.progress.connect(self.update_progress)
         thread.finished.connect(self.download_complete)
-        thread.error.connect(self.show_error)  
+        thread.error.connect(self.show_error)
         thread.start()
         self.threads.append(thread)
 
-    def update_progress(self, video_index, progress):
+    def update_progress(self, video_index, progress, speed, downloaded):
+        """Update the progress bar and labels in real time."""
         item = self.list_widget.item(video_index)
-        progress_bar = self.list_widget.itemWidget(item)
-        progress_bar.setValue(progress)
+        widget = self.list_widget.itemWidget(item)
+
+        if widget:
+            labels = widget.findChildren(QLabel)
+            progress_bar = widget.findChild(QProgressBar)
+
+            labels[0].setText("Downloading...")  
+            progress_bar.setValue(progress)
+            labels[1].setText(f"Speed: {speed}")  
+            labels[2].setText(f"Downloaded: {downloaded}")  
 
     def download_complete(self, video_index):
+        """Update the UI when the download completes."""
         item = self.list_widget.item(video_index)
-        progress_bar = self.list_widget.itemWidget(item)
-        progress_bar.setValue(100)
+        widget = self.list_widget.itemWidget(item)
+
+        if widget:
+            labels = widget.findChildren(QLabel)
+            progress_bar = widget.findChild(QProgressBar)
+
+            labels[0].setText("Download Complete!")  
+            progress_bar.setValue(100)
 
     def show_error(self, message):
         """Display an error message in a popup."""
